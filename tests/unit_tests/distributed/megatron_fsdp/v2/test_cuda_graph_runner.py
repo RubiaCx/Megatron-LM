@@ -29,8 +29,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.cuda_graph_runner impor
     _restore_compiled_modules_after_capture_failure,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import _pre_backward_setup
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+    _pre_backward_setup,
+    mfsdp_forward_pre_hook,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime.graph import (
+    _MFSDP_CAPTURE_CAPABILITIES,
     _get_compatible_main_grad_buffer,
     _get_static_grad_buffers,
     _refresh_module_parameter_surface,
@@ -41,7 +45,7 @@ from megatron.core.tensor_parallel.layers import linear_with_grad_accumulation_a
 
 
 def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
-    """Warmup grads must not survive outside the CUDA graph private pool."""
+    """Capture-only grads must not keep their TracePool slot active."""
     full_param = torch.nn.Parameter(torch.ones(4))
     full_param.grad = torch.full_like(full_param, 2)
     full_param.main_grad = torch.full_like(full_param, 3)
@@ -50,8 +54,15 @@ def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
     dist_param.grad = torch.full_like(dist_param, 4)
 
     reshard_calls = []
+    release_calls = []
     module = SimpleNamespace(
-        _fsdp_param_groups=[SimpleNamespace(params=[full_param], dist_params=[dist_param])],
+        _fsdp_param_groups=[
+            SimpleNamespace(
+                params=[full_param],
+                dist_params=[dist_param],
+                release_grad_buffer=lambda: release_calls.append(True),
+            )
+        ],
         reshard=lambda: reshard_calls.append(True),
     )
 
@@ -61,6 +72,40 @@ def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
     assert torch.equal(full_param.main_grad, torch.full_like(full_param, 3))
     assert torch.equal(dist_param.grad, torch.full_like(dist_param, 4))
     assert reshard_calls == [True]
+    assert release_calls == [True]
+
+
+def test_recompute_fetches_forward_buffer_without_forward_prefetch():
+    """Fetch both compute buffers without forward-order prefetch during recompute."""
+    unshard_calls = []
+    target = SimpleNamespace(
+        _fsdp_root_context=SimpleNamespace(
+            backward_phase=True, cuda_graph_active=False, enable_unshard_prefetch=True
+        ),
+        _fsdp_state=SimpleNamespace(_is_root=False),
+        _fsdp_param_groups=(),
+        unshard=lambda **kwargs: unshard_calls.append(kwargs),
+    )
+
+    with patch(
+        "megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks._find_fsdp_target",
+        return_value=target,
+    ):
+        mfsdp_forward_pre_hook(object(), (), {})
+
+    assert unshard_calls == [
+        {"async_op": True, "bwd_pass": True},
+        {"async_op": False, "bwd_pass": False},
+    ]
+
+
+def test_vendored_runtime_declares_release_safe_mfsdp_capture():
+    """Require installed runtimes to match the capture buffer lifetime contract."""
+    assert {
+        "capture_grad_buffer_release",
+        "parameter_surface_refresh",
+        "static_grad_binding",
+    }.issubset(_MFSDP_CAPTURE_CAPABILITIES)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -500,6 +545,20 @@ def test_cuda_graph_replay_restores_leaf_grad_and_reuses_main_grad(dtype):
         assert module.weight.grad is not None
         assert module.weight.grad.data_ptr() == main_grad.data_ptr()
         module.weight.grad = None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
+def test_cuda_graph_capture_does_not_refetch_main_grad_for_clone_policy():
+    """Reuse the capture-time main-grad view when selecting returned clone slots."""
+    module = torch.nn.Linear(4, 3, bias=False, device="cuda")
+    main_grad = torch.zeros_like(module.weight)
+    getter_calls = []
+    module.weight.get_main_grad = lambda: getter_calls.append(True) or main_grad
+    sample = torch.ones(2, 4, device="cuda")
+
+    make_graphed_callables(module, (), sample_kwargs={"input": sample}, num_warmup_iters=1)
+
+    assert getter_calls == [True]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")

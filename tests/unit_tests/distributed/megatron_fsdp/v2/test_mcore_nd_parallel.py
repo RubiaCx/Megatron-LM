@@ -100,7 +100,9 @@ class TestMegatronFSDPE2E:
                             torch.empty_like(buffer.data)
                             for _ in range(torch.distributed.get_world_size(param_group.dp_group))
                         ]
-                        torch.distributed.all_gather(gathered, buffer.data, group=param_group.dp_group)
+                        torch.distributed.all_gather(
+                            gathered, buffer.data, group=param_group.dp_group
+                        )
                         for group_rank, replica in enumerate(gathered):
                             assert torch.equal(buffer.data, replica), (
                                 f"Replicated {buffer_name} mismatch for "
@@ -159,9 +161,7 @@ class TestMegatronFSDPE2E:
         ETP = kwargs.pop("ETP", 1)
         OUTER_DP = kwargs.pop("OUTER_DP", 1)
         capture_param_snapshots = kwargs.pop("capture_param_snapshots", False)
-        verify_replicated_weight_buffers = kwargs.pop(
-            "verify_replicated_weight_buffers", False
-        )
+        verify_replicated_weight_buffers = kwargs.pop("verify_replicated_weight_buffers", False)
         return_dict = kwargs.pop("return_dict", capture_param_snapshots)
 
         # Initialize model parallel groups
@@ -242,9 +242,7 @@ class TestMegatronFSDPE2E:
                 )
                 torch.cuda.reset_peak_memory_stats()
             if capture_param_snapshots:
-                param_snapshots.append(
-                    TestMegatronFSDPE2E._capture_named_params(model_chunks)
-                )
+                param_snapshots.append(TestMegatronFSDPE2E._capture_named_params(model_chunks))
 
         Utils.destroy_model_parallel()
 
@@ -289,6 +287,23 @@ class TestMegatronFSDPE2E:
                     use_megatron_fsdp_v2=True,
                 ),
                 id="optim_grads_params_mxfp8_param_gather",
+            ),
+            pytest.param(
+                dict(
+                    bf16=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    moe_grouped_gemm=True,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    use_megatron_fsdp_v2=True,
+                ),
+                id="optim_grads_params_mxfp8_param_gather_recompute",
             ),
             pytest.param(
                 dict(
@@ -521,9 +536,7 @@ class TestMegatronFSDPE2E:
             return
 
         assert len(actual["outputs"]) == len(reference["outputs"])
-        for step, (output, ref_output) in enumerate(
-            zip(actual["outputs"], reference["outputs"])
-        ):
+        for step, (output, ref_output) in enumerate(zip(actual["outputs"], reference["outputs"])):
             loss = output["lm loss"]
             ref_loss = ref_output["lm loss"]
             assert_close(
@@ -546,9 +559,9 @@ class TestMegatronFSDPE2E:
             zip(actual["param_snapshots"], reference["param_snapshots"])
         ):
             missing = sorted(set(ref_params) ^ set(params))
-            assert not missing, (
-                f"Parameter key mismatch at step {step}, strategy={strategy}: {missing[:20]}"
-            )
+            assert (
+                not missing
+            ), f"Parameter key mismatch at step {step}, strategy={strategy}: {missing[:20]}"
             for name in sorted(ref_params):
                 assert_close(
                     params[name],
@@ -587,9 +600,7 @@ class TestMegatronFSDPE2E:
             for strategy in ("optim", "optim_grads")
         ],
     )
-    def test_zero_strategy_non_equivalent_precision_paths_run(
-        self, strategy, precision_configs
-    ):
+    def test_zero_strategy_non_equivalent_precision_paths_run(self, strategy, precision_configs):
         """Exercise valid ZeRO paths that intentionally lack a strict reference.
 
         MXFP8 ZeRO-1/2 refreshes replicated quantized compute buffers after

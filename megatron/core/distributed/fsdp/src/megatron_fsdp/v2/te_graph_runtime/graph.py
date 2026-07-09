@@ -15,6 +15,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 UPSTREAM_TE_VERSION = "v2.16"
 UPSTREAM_TE_COMMIT = "4220403e831d29e93868f7793693ea83f6b8b05b"
 UPSTREAM_TE_GRAPH_PATH = "transformer_engine/pytorch/graph.py"
+_MFSDP_CAPTURE_CAPABILITIES = frozenset(
+    {"capture_grad_buffer_release", "parameter_surface_refresh", "static_grad_binding"}
+)
 
 __all__ = [
     "UPSTREAM_TE_COMMIT",
@@ -884,18 +887,25 @@ def _make_graphed_callables(
     bwd_dw_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
     graph_callables = [None for _ in range(len(flatten_sample_args))]
 
-    def _returned_param_grad_clone_slots(static_grad_inputs, module_params):
+    def _returned_param_grad_clone_slots(static_grad_inputs, module_params, input_grad_buffers):
         """Snapshot static grad slots that need clones before Graphed.backward returns."""
         if not _clone_param_grads_on_return:
             return (False,) * len(static_grad_inputs)
         module_param_start = len(static_grad_inputs) - len(module_params)
+        module_grad_buffers = (
+            input_grad_buffers[-len(module_params) :]
+            if len(input_grad_buffers) >= len(module_params)
+            else (None,) * len(module_params)
+        )
         clone_slots = []
         for idx, grad_input in enumerate(static_grad_inputs):
             if idx < module_param_start:
                 clone_slots.append(False)
                 continue
             param = module_params[idx - module_param_start]
-            main_grad = _get_compatible_main_grad_buffer(param) if use_main_grad else None
+            main_grad = (
+                module_grad_buffers[idx - module_param_start] if use_main_grad else None
+            )
             uses_main_grad = (
                 grad_input is not None
                 and main_grad is not None
@@ -1321,6 +1331,7 @@ def _make_graphed_callables(
                             torch.empty_like(o) if o is not None and o.requires_grad else None
                             for o in static_outputs
                         )
+                    input_grad_buffers = ()
                     if is_training:
                         func = graph_callables[per_callable_bwd_idx]
                         _call_capture_time_backward_pre_hooks(
@@ -1376,7 +1387,9 @@ def _make_graphed_callables(
                     per_callable_static_grad_outputs[per_callable_bwd_idx] = static_grad_outputs
                     per_callable_static_grad_inputs[per_callable_bwd_idx] = static_grad_inputs
                     returned_param_grad_clone_slots = _returned_param_grad_clone_slots(
-                        static_grad_inputs, per_callable_module_params[per_callable_bwd_idx]
+                        static_grad_inputs,
+                        per_callable_module_params[per_callable_bwd_idx],
+                        input_grad_buffers,
                     )
                     per_callable_returned_param_grad_clone_slots[per_callable_bwd_idx] = (
                         returned_param_grad_clone_slots
@@ -1486,6 +1499,7 @@ def _make_graphed_callables(
                     grad_output = torch.empty_like(output)
                 static_grad_outputs.append(grad_output)
             static_grad_outputs = tuple(static_grad_outputs)
+            input_grad_buffers = ()
             if is_training:
                 func = graph_callables[bwd_idx]
                 _call_capture_time_backward_pre_hooks(bwd_idx, func, static_grad_outputs)
@@ -1534,7 +1548,7 @@ def _make_graphed_callables(
             per_callable_static_grad_inputs.append(static_grad_inputs)
             per_callable_returned_param_grad_clone_slots.append(
                 _returned_param_grad_clone_slots(
-                    static_grad_inputs, per_callable_module_params[bwd_idx]
+                    static_grad_inputs, per_callable_module_params[bwd_idx], input_grad_buffers
                 )
             )
 

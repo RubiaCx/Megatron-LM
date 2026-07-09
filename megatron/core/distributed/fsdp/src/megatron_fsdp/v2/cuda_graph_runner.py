@@ -284,17 +284,26 @@ class CudaGraphRunner:
         try:
             from te_graph_runtime import make_graphed_callables
             from te_graph_runtime.graph import (
+                _MFSDP_CAPTURE_CAPABILITIES as _installed_mfsdp_capabilities,
+            )
+            from te_graph_runtime.graph import (
                 _get_compatible_main_grad_buffer as _installed_static_grad_support,
             )
             from te_graph_runtime.graph import (
                 _refresh_module_parameter_surface as _installed_parameter_refresh,
             )
 
+            required_capabilities = {
+                "capture_grad_buffer_release",
+                "parameter_surface_refresh",
+                "static_grad_binding",
+            }
             if (
                 not all(
                     callable(helper)
                     for helper in (_installed_static_grad_support, _installed_parameter_refresh)
                 )
+                or not required_capabilities.issubset(_installed_mfsdp_capabilities)
                 or "use_main_grad" not in inspect.signature(make_graphed_callables).parameters
             ):
                 raise ImportError("Installed te-graph-runtime lacks M-FSDP CUDA graph support")
@@ -477,9 +486,10 @@ def _make_bwd_pre_hook(module):
 def _make_bwd_post_hook(module):
     def hook(mod, grad_input, grad_output):
         module.reshard()
-        # Clear grad to avoid memory leak in CUDA graph capture.
+        # Clear capture-only views before the next module reuses their slots.
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 param.grad = None
+            param_group.release_grad_buffer()
 
     return hook

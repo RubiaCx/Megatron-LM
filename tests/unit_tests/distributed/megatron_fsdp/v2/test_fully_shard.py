@@ -793,7 +793,7 @@ class TestActivationCheckpointing:
             assert not torch.isinf(torch.tensor(loss_val)), f"Loss at step {i} is Inf"
 
     def test_activation_checkpointing_with_overlap(self):
-        """Activation checkpointing should work with unshard_prefetch and async_reduce_grad."""
+        """Checkpoint recompute should not leave prefetched weight buffers unsharded."""
         torch.manual_seed(42)
         device = _device()
         model = MLPWithCheckpointing(hidden=128, num_layers=4).to(device)
@@ -809,6 +809,12 @@ class TestActivationCheckpointing:
         loss.backward()
 
         assert not torch.isnan(torch.tensor(loss.item()))
+        for layer in model.layers:
+            assert model._fsdp_root_context.unshard_done_events[id(layer)] is None
+            for param_group in layer._fsdp_param_groups:
+                assert not param_group.model_weight_buffer.is_unsharded()
+                if param_group.transpose_weight_buffer is not None:
+                    assert not param_group.transpose_weight_buffer.is_unsharded()
 
     def test_activation_checkpointing_nested_fsdp(self):
         """Activation checkpointing with nested FSDP (expert-in-layer) should work."""
