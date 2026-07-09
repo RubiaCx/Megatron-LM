@@ -290,9 +290,12 @@ class CudaGraphRunner:
                 _refresh_module_parameter_surface as _installed_parameter_refresh,
             )
 
-            if not all(
-                callable(helper)
-                for helper in (_installed_static_grad_support, _installed_parameter_refresh)
+            if (
+                not all(
+                    callable(helper)
+                    for helper in (_installed_static_grad_support, _installed_parameter_refresh)
+                )
+                or "use_main_grad" not in inspect.signature(make_graphed_callables).parameters
             ):
                 raise ImportError("Installed te-graph-runtime lacks M-FSDP CUDA graph support")
         except ImportError:
@@ -404,6 +407,7 @@ class CudaGraphRunner:
                 pool=self._graph_pool,
                 capture_time_hooks=capture_hooks,
                 capture_stream=capture_stream,
+                use_main_grad=True,
                 **runtime_options,
             )
         except Exception:

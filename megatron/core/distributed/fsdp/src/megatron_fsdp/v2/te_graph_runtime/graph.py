@@ -522,6 +522,7 @@ def _make_graphed_callables(
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
+    use_main_grad: bool = False,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -894,7 +895,7 @@ def _make_graphed_callables(
                 clone_slots.append(False)
                 continue
             param = module_params[idx - module_param_start]
-            main_grad = _get_compatible_main_grad_buffer(param)
+            main_grad = _get_compatible_main_grad_buffer(param) if use_main_grad else None
             uses_main_grad = (
                 grad_input is not None
                 and main_grad is not None
@@ -1337,7 +1338,11 @@ def _make_graphed_callables(
                         inputs = tuple(
                             i for i in static_input_surface if i is not None and i.requires_grad
                         )
-                        input_grad_buffers = _get_static_grad_buffers(inputs)
+                        input_grad_buffers = (
+                            _get_static_grad_buffers(inputs)
+                            if use_main_grad
+                            else (None,) * len(inputs)
+                        )
                         # Enter graph capture first so buffer zeroing is recorded.
                         with (
                             _graph_context_wrapper(bwd_graph, pool=mempool, stream=capture_stream),
@@ -1490,7 +1495,9 @@ def _make_graphed_callables(
                 per_callable_module_params[bwd_idx] = module_params
                 per_callable_static_input_surfaces[bwd_idx] = static_input_surface
                 inputs = tuple(i for i in static_input_surface if i is not None and i.requires_grad)
-                input_grad_buffers = _get_static_grad_buffers(inputs)
+                input_grad_buffers = (
+                    _get_static_grad_buffers(inputs) if use_main_grad else (None,) * len(inputs)
+                )
                 # Enter graph capture first so buffer zeroing is recorded.
                 with (
                     _graph_context_wrapper(bwd_graph, pool=mempool),
@@ -1887,6 +1894,7 @@ def make_graphed_callables(
     post_warmup_hook: Optional[Callable] = None,
     capture_time_hooks: Optional[List[Optional[Dict[str, Dict]]]] = None,
     capture_stream: Optional[torch.cuda.Stream] = None,
+    use_main_grad: bool = False,
 ) -> Union[Callable, Tuple[Callable, ...]]:
     """
     Make CUDA graph version of Transformer Engine modules
@@ -1912,6 +1920,9 @@ def make_graphed_callables(
     allow_unused_input: bool, default = False
                         Whether to handle case where callable inputs
                         and outputs are disconnected in compute graph.
+    use_main_grad: bool, default = False
+                   Whether to bind compatible leaf gradients directly to
+                   caller-owned main-grad buffers during backward capture.
     sample_kwargs: (tuple of) dict, optional
                    Keyword arguments to callable(s)
     pool: (tuple of) int, default = None, optional
@@ -1980,6 +1991,9 @@ def make_graphed_callables(
                             in the optimizer step.
 
     """
+
+    if not isinstance(use_main_grad, bool):
+        raise TypeError(f"use_main_grad must be a bool, but got {type(use_main_grad).__name__}")
 
     te_available = _prepare_runtime()
 
@@ -2162,6 +2176,7 @@ def make_graphed_callables(
         post_warmup_hook=post_warmup_hook,
         capture_time_hooks=capture_time_hooks,
         capture_stream=capture_stream,
+        use_main_grad=use_main_grad,
     )
 
     # Ensures warmup does not affect numerics for ops such as dropout.

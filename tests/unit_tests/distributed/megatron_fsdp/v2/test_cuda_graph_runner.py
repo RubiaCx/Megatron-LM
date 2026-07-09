@@ -307,6 +307,32 @@ def test_static_grad_context_accumulates_into_main_grad_buffer():
     assert param.grad is None
 
 
+def test_make_graphed_callables_rejects_non_bool_use_main_grad():
+    """Reject ambiguous main-grad capture configuration."""
+    with pytest.raises(TypeError, match="use_main_grad must be a bool"):
+        make_graphed_callables(torch.nn.Linear(2, 2), (), use_main_grad=None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
+def test_cuda_graph_replay_can_disable_main_grad_binding():
+    """Keep parameter gradients on the normal autograd path when disabled."""
+    module = torch.nn.Linear(4, 3, bias=False, device="cuda")
+    main_grad = torch.zeros_like(module.weight)
+    getter_calls = []
+    module.weight.get_main_grad = lambda: getter_calls.append(True) or main_grad
+    sample = torch.ones(2, 4, device="cuda")
+
+    graphed = make_graphed_callables(
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=False
+    )
+    graphed(input=torch.full_like(sample, 2.0)).sum().backward()
+    torch.cuda.synchronize()
+
+    assert getter_calls == []
+    torch.testing.assert_close(module.weight.grad, torch.full_like(module.weight, 4.0))
+    torch.testing.assert_close(main_grad, torch.zeros_like(main_grad))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires a GPU")
 def test_cuda_graph_replay_preserves_mfsdp_microbatch_accumulation():
     """Accumulate two M-FSDP microbatches without static main-grad binding."""
@@ -318,7 +344,7 @@ def test_cuda_graph_replay_preserves_mfsdp_microbatch_accumulation():
     sample = torch.ones(2, 4, device="cuda")
 
     graphed = make_graphed_callables(
-        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=True
     )
 
     for value in (2.0, 3.0):
@@ -342,7 +368,7 @@ def test_cuda_graph_replay_keeps_mixed_dtype_main_grad_lazy():
     sample = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
 
     graphed = make_graphed_callables(
-        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=True
     )
     graphed(input=torch.full_like(sample, 2.0)).sum().backward()
     torch.cuda.synchronize()
@@ -434,7 +460,7 @@ def test_cuda_graph_replay_te_fused_wgrad_main_grad(overwrite_main_grad, values,
     )
     sample = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
     graphed = make_graphed_callables(
-        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=True
     )
 
     main_grad.zero_()
@@ -460,7 +486,7 @@ def test_cuda_graph_replay_restores_leaf_grad_and_reuses_main_grad(dtype):
     sample = torch.ones(2, 4, device="cuda", dtype=dtype)
 
     graphed = make_graphed_callables(
-        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=True
     )
 
     assert module.weight.grad is None
