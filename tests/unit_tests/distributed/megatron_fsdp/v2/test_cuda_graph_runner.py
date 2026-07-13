@@ -556,7 +556,9 @@ def test_cuda_graph_capture_does_not_refetch_main_grad_for_clone_policy():
     module.weight.get_main_grad = lambda: getter_calls.append(True) or main_grad
     sample = torch.ones(2, 4, device="cuda")
 
-    make_graphed_callables(module, (), sample_kwargs={"input": sample}, num_warmup_iters=1)
+    make_graphed_callables(
+        module, (), sample_kwargs={"input": sample}, num_warmup_iters=1, use_main_grad=True
+    )
 
     assert getter_calls == [True]
 

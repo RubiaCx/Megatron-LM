@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch.utils._pytree import register_pytree_node
 
 
 @dataclass
@@ -64,3 +65,55 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+_PACKED_SEQ_DYNAMIC_FIELDS = (
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+    "seq_idx",
+)
+_PACKED_SEQ_STATIC_FIELDS = (
+    "qkv_format",
+    "max_seqlen_q",
+    "max_seqlen_kv",
+    "local_cp_size",
+    "cp_group",
+    "total_tokens",
+)
+
+
+def _flatten_packed_seq_params(packed_seq_params):
+    """Separate dynamic tensors from static packed-sequence metadata.
+
+    :param packed_seq_params: Packed-sequence metadata to flatten.
+    :type packed_seq_params: PackedSeqParams
+    :return: Dynamic tensor fields and static metadata.
+    :rtype: Tuple[Tuple[Optional[Tensor], ...], Tuple[Any, ...]]
+    """
+    return (
+        tuple(getattr(packed_seq_params, name) for name in _PACKED_SEQ_DYNAMIC_FIELDS),
+        tuple(getattr(packed_seq_params, name) for name in _PACKED_SEQ_STATIC_FIELDS),
+    )
+
+
+def _unflatten_packed_seq_params(tensor_fields, static_fields):
+    """Rebuild packed-sequence metadata without launching CUDA work.
+
+    :param tensor_fields: Dynamic tensor fields supplied by a PyTree consumer.
+    :type tensor_fields: Tuple[Optional[Tensor], ...]
+    :param static_fields: Static packed-sequence metadata.
+    :type static_fields: Tuple[Any, ...]
+    :return: Reconstructed packed-sequence metadata.
+    :rtype: PackedSeqParams
+    """
+    packed_seq_params = object.__new__(PackedSeqParams)
+    for name, value in zip(_PACKED_SEQ_DYNAMIC_FIELDS, tensor_fields, strict=True):
+        setattr(packed_seq_params, name, value)
+    for name, value in zip(_PACKED_SEQ_STATIC_FIELDS, static_fields, strict=True):
+        setattr(packed_seq_params, name, value)
+    return packed_seq_params
+
+
+register_pytree_node(PackedSeqParams, _flatten_packed_seq_params, _unflatten_packed_seq_params)

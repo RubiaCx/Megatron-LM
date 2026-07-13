@@ -54,6 +54,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.packed_seq_params import PackedSeqParams
 
 # ------------------------------------------------------------------ #
 #  Distributed environment (NCCL session-scoped)
@@ -98,6 +99,23 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.fc(x)
+
+
+class PackedSequenceMLP(SimpleMLP):
+    """Use packed-sequence metadata in a fully sharded module."""
+
+    def forward(self, x, packed_seq_params):
+        """Scale the linear output with a dynamic cumulative length.
+
+        :param x: Input activations.
+        :type x: torch.Tensor
+        :param packed_seq_params: Dynamic THD layout metadata.
+        :type packed_seq_params: PackedSeqParams
+        :return: Layout-dependent linear output.
+        :rtype: torch.Tensor
+        """
+        scale = packed_seq_params.cu_seqlens_q[1].to(x.dtype)
+        return super().forward(x) * scale
 
 
 class TinyLLM(nn.Module):
@@ -330,6 +348,38 @@ class TestFullyShardBasic:
                 torch.testing.assert_close(
                     dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
                 )
+
+    def test_cuda_graph_updates_packed_sequence_layout(self):
+        """Replay a fully sharded graph with a different THD layout."""
+        model = PackedSequenceMLP(hidden=4).to(_device())
+        with torch.no_grad():
+            model.fc.weight.fill_(1)
+        fully_shard(
+            model,
+            sharding_strategy="optim_grads_params",
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            enable_cuda_graph=True,
+        )
+        sample = torch.ones(2, 4, device=_device(), requires_grad=True)
+        layouts = (
+            torch.tensor([0, 2, 5, 8], dtype=torch.int32, device=_device()),
+            torch.tensor([0, 1, 4, 8], dtype=torch.int32, device=_device()),
+        )
+
+        for cu_seqlens in layouts:
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd", cu_seqlens_q=cu_seqlens, max_seqlen_q=3, max_seqlen_kv=3
+            )
+            model(sample, packed_seq_params).sum().backward()
+        model.finish_grad_sync()
+        torch.cuda.synchronize()
+
+        dist_grad = model._fsdp_param_groups[0].dist_grads[0]
+        expected = 6.0 * _world_size()
+        torch.testing.assert_close(
+            dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
+        )
 
     @pytest.mark.parametrize(
         "enable_unshard_prefetch,enable_async_reduce_grad",
