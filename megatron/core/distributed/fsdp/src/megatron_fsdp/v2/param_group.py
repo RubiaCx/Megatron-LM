@@ -108,6 +108,7 @@ class ParameterGroup:
         self.hsdp_wbuf: Optional[DataParallelBuffer] = None
         self.hsdp_gbuf: Optional[DataParallelBuffer] = None
         self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
+        self._main_grad_buffer_has_unreduced_data = False
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
@@ -288,6 +289,7 @@ class ParameterGroup:
             overwrite_grad=self._grad_buffer_is_fresh,
             stream=stream,
         )
+        self._main_grad_buffer_has_unreduced_data = False
         self._grad_buffer_is_fresh = False
 
     def release_grad_buffer(self):
@@ -304,17 +306,27 @@ class ParameterGroup:
     def _maybe_free_grad_data(self) -> None:
         """Drop ``main_grad_buffer.data`` if all params are zero-graded.
 
-        After ``zero_grad()`` (or before the first backward), all
-        ``dist_param.grad`` are ``None``, so the gradient buffer holds no
-        meaningful data.  Free the backing tensor — ``_init_dist_grads``
-        will re-allocate on the next ``reduce_grad``.
+        Preserve fused-wgrad data until deferred reduction consumes it. CUDA
+        Graph replay also requires non-distributed fused buffers to keep their
+        captured address, so zero those buffers in place after optimizer clear.
         """
         if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
+            return
+        if self._main_grad_buffer_has_unreduced_data:
             return
         if any(
             [getattr(p, "grad", None) is not None for p in self.dist_params] +
             [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
         ):
+            return
+        if (
+            not self.main_grad_buffer.is_distributed
+            and any(
+                getattr(param, "_mfsdp_recorded_te_wgrad", False)
+                for param in self.params
+            )
+        ):
+            self.main_grad_buffer.data.zero_()
             return
         self.main_grad_buffer.data = None
         self.dist_grads = [None for _ in self.params]
@@ -452,6 +464,7 @@ class ParameterGroup:
 
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
+        self._main_grad_buffer_has_unreduced_data = False
         if set_to_none:
             for dist_param in self.dist_params:
                 if dist_param.grad is not None:

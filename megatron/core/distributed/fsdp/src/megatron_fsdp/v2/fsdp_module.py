@@ -14,6 +14,7 @@
 
 """FSDPModule implementation for Megatron-FSDP2."""
 
+import gc
 import logging
 import weakref
 from contextlib import contextmanager, nullcontext
@@ -249,10 +250,30 @@ class FSDPModule:
         are re-captured by the hooks on the next forward pass.
 
         Typical use: temporarily free GPU memory (e.g. for checkpoint I/O).
+
+        Raises if a replicated fused-wgrad buffer has not been synchronized;
+        callers must finish gradient synchronization before destroying its
+        owning graph and allocator state.
         """
         ctx = self._fsdp_root_context
+        root_module = ctx.get_root_module()
+        if root_module is not None and root_module is not self:
+            root_module.release_memory_pool()
+            return
+
         allocator = ctx.bucket_allocator
-        for module in self._get_fsdp_modules(recursive=True):
+        fsdp_modules = self._get_fsdp_modules(recursive=True)
+        if any(
+            getattr(pg, "_main_grad_buffer_has_unreduced_data", False)
+            for module in fsdp_modules
+            for pg in module._fsdp_param_groups
+        ):
+            raise RuntimeError(
+                "release_memory_pool() requires finish_grad_sync() when "
+                "main-grad buffers contain unreduced gradients"
+            )
+
+        for module in fsdp_modules:
             for pg in module._fsdp_param_groups:
                 pg.release_grad_buffer()
 
@@ -278,6 +299,10 @@ class FSDPModule:
         if not ctx.enable_cuda_graph:
             return
 
+        if ctx.cuda_graph_runner is not None:
+            ctx.cuda_graph_runner.reset()
+            ctx.cuda_graph_runner = None
+
         for module in ctx.forward_order:
             if hasattr(module, "_fsdp_cg_runner"):
                 runner = module._fsdp_cg_runner
@@ -288,6 +313,7 @@ class FSDPModule:
         ctx.cuda_graph_active = False
         ctx.cuda_graph_stream = None
         ctx.cuda_graph_pool = None
+        gc.collect()
 
     @staticmethod
     def _clear_cuda_graph_sentinels(ctx: "_FSDPRootContext") -> None:
@@ -451,24 +477,32 @@ class FSDPModule:
         unsharded gradient buffers.
         """
 
-        def main_grad_getter(p):
-            """Get main gradient from buffer with proper offset/size."""
-            gbuf = p._gbuf
-            item_id = p._item_id
+        def make_main_grad_getter(param_group):
+            """Build a lazy main-gradient accessor for one parameter group."""
 
-            gbuf_data = gbuf.fetch_buffer()
-            assert gbuf_data is not None
-            assert gbuf_data.numel() > 0
+            def main_grad_getter(p):
+                """Return the caller parameter's main-gradient view."""
+                gbuf = p._gbuf
+                if gbuf.data is None:
+                    param_group._init_dist_grads()
+                item_id = p._item_id
 
-            # Get offset and size from buffer index
-            start, end = gbuf.buffer_index._get_item_global_range(item_id)
-            param_shape = gbuf.buffer_index.item_index_map[item_id].shape
-            grad_data = gbuf_data[start:end].view(param_shape)
+                gbuf_data = gbuf.fetch_buffer()
+                assert gbuf_data is not None
+                assert gbuf_data.numel() > 0
 
-            return grad_data
+                # Get offset and size from buffer index
+                start, end = gbuf.buffer_index._get_item_global_range(item_id)
+                param_shape = gbuf.buffer_index.item_index_map[item_id].shape
+                grad_data = gbuf_data[start:end].view(param_shape)
+
+                return grad_data
+
+            return main_grad_getter
 
         # Attach getter to each parameter
         for param_group in self._fsdp_param_groups:
+            main_grad_getter = make_main_grad_getter(param_group)
             for param in param_group.params:
                 setattr(param, "_gbuf", param_group.main_grad_buffer)
                 setattr(param, "_item_id", param_group.param_idx[param])

@@ -38,13 +38,16 @@ Single-GPU tests:
 """
 
 import sys
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 from torch.distributed.checkpoint.state_dict import get_state_dict as torch_get_state_dict
+from torch.distributed.device_mesh import init_device_mesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -54,6 +57,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.tensor_parallel.layers import (
+    linear_with_grad_accumulation_and_async_allreduce,
+)
 
 # ------------------------------------------------------------------ #
 #  Distributed environment (NCCL session-scoped)
@@ -289,10 +295,11 @@ class TestFullyShardBasic:
             pytest.param(torch.bfloat16, torch.float32, id="bf16-param-fp32-grad"),
         ],
     )
+    @pytest.mark.parametrize("async_reduce", [False, True], ids=["sync-reduce", "async-reduce"])
     def test_cuda_graph_accumulates_microbatches(
-        self, sharding_strategy, model_dtype, main_grad_dtype
+        self, request, sharding_strategy, model_dtype, main_grad_dtype, async_reduce
     ):
-        """Accumulate one eager and one replayed M-FSDP microbatch.
+        """Accumulate one eager and one recomputed CUDA Graph microbatch.
 
         :param sharding_strategy: M-FSDP gradient sharding strategy.
         :type sharding_strategy: str
@@ -300,8 +307,13 @@ class TestFullyShardBasic:
         :type model_dtype: torch.dtype
         :param main_grad_dtype: Optimizer gradient dtype.
         :type main_grad_dtype: Optional[torch.dtype]
+        :param async_reduce: Whether ordinary post-backward reductions use the side stream.
+        :type async_reduce: bool
+        :param request: Pytest request used for post-call graph cleanup.
+        :type request: pytest.FixtureRequest
         """
         model = SimpleMLP(4, bias=True).to(_device(), dtype=model_dtype)
+        model.gradient_checkpointing = True
         fully_shard(
             model,
             sharding_strategy=sharding_strategy,
@@ -309,15 +321,31 @@ class TestFullyShardBasic:
                 main_params_dtype=main_grad_dtype, main_grads_dtype=main_grad_dtype
             ),
             enable_unshard_prefetch=False,
-            enable_async_reduce_grad=False,
+            enable_async_reduce_grad=async_reduce,
             enable_cuda_graph=True,
         )
+
+        def release_graph_pool():
+            """Release graphs after the test call drops output references."""
+            model.release_memory_pool()
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+
+        request.addfinalizer(release_graph_pool)
+
+        def assert_reduced_compute_grads_cleared():
+            """Check that reduced compute leaves do not retain main-grad aliases."""
+            if sharding_strategy not in ("optim_grads", "optim_grads_params"):
+                return
+            for param_group in model._fsdp_param_groups:
+                assert all(param.grad is None for param in param_group.params)
 
         for value in (2.0, 3.0):
             sample = torch.full(
                 (2, 4), value, device=_device(), dtype=model_dtype, requires_grad=True
             )
             model(sample).sum().backward()
+            assert_reduced_compute_grads_cleared()
         model.finish_grad_sync()
         torch.cuda.synchronize()
 
@@ -330,6 +358,278 @@ class TestFullyShardBasic:
                 torch.testing.assert_close(
                     dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
                 )
+
+        model.zero_grad(set_to_none=False)
+        original_unshard = model.unshard
+        unshard_calls = []
+
+        def counted_unshard(*args, **kwargs):
+            """Count live unshards after CUDA Graph installation."""
+            unshard_calls.append((args, kwargs))
+            return original_unshard(*args, **kwargs)
+
+        model.unshard = counted_unshard
+        first_sample = torch.full(
+            (2, 4), 4.0, device=_device(), dtype=model_dtype, requires_grad=True
+        )
+        first_output = model(first_sample)
+        unshards_after_first = len(unshard_calls)
+
+        def assert_model_weight_buffers_sharded():
+            """Assert every full-shard model-weight buffer is resharded."""
+            if sharding_strategy != "optim_grads_params":
+                return
+            for param_group in model._fsdp_param_groups:
+                assert param_group.model_weight_buffer is not None
+                assert param_group.model_weight_buffer.is_distributed
+
+        assert_model_weight_buffers_sharded()
+        with pytest.raises(RuntimeError, match="backward to finish before the next forward"):
+            model(
+                torch.full(
+                    (2, 4), 5.0, device=_device(), dtype=model_dtype, requires_grad=True
+                )
+            )
+        assert len(unshard_calls) == unshards_after_first
+        assert_model_weight_buffers_sharded()
+
+        first_output.sum().backward()
+        assert_reduced_compute_grads_cleared()
+        model.finish_grad_sync()
+        torch.cuda.synchronize()
+        assert_model_weight_buffers_sharded()
+        for param_names, param_group in model._named_param_groups:
+            for name, dist_grad in zip(param_names, param_group.dist_grads):
+                if dist_grad is None:
+                    continue
+                local_expected = 8.0 if name.endswith("weight") else 2.0
+                expected = local_expected * _world_size()
+                torch.testing.assert_close(
+                    dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
+                )
+
+        model.zero_grad(set_to_none=True)
+        later_sample = torch.full(
+            (2, 4), 6.0, device=_device(), dtype=model_dtype, requires_grad=True
+        )
+        model(later_sample).sum().backward()
+        assert_reduced_compute_grads_cleared()
+        model.finish_grad_sync()
+        torch.cuda.synchronize()
+        assert_model_weight_buffers_sharded()
+        for param_names, param_group in model._named_param_groups:
+            for name, dist_grad in zip(param_names, param_group.dist_grads):
+                if dist_grad is None:
+                    continue
+                local_expected = 12.0 if name.endswith("weight") else 2.0
+                expected = local_expected * _world_size()
+                torch.testing.assert_close(
+                    dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
+                )
+
+    @pytest.mark.parametrize(
+        "main_grad_dtype",
+        [
+            pytest.param(torch.bfloat16, id="bf16-main-grad"),
+            pytest.param(torch.float32, id="fp32-main-grad"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
+    )
+    @pytest.mark.parametrize(
+        "async_reduce", [False, True], ids=["sync-reduce", "async-reduce"]
+    )
+    def test_cuda_graph_recompute_te_fused_wgrad_2rank(
+        self, main_grad_dtype, sharding_strategy, async_reduce
+    ):
+        """Replay TE fused wgrad through a real distributed main-grad buffer.
+
+        :param main_grad_dtype: Optimizer gradient dtype.
+        :type main_grad_dtype: torch.dtype
+        :param sharding_strategy: M-FSDP gradient sharding strategy.
+        :type sharding_strategy: str
+        :param async_reduce: Whether sharded gradients reduce on the side stream.
+        :type async_reduce: bool
+        """
+        if _world_size() != 2:
+            pytest.skip("This integration test requires two ranks")
+
+        from megatron.core.extensions.transformer_engine import te_general_gemm
+
+        if te_general_gemm is None:
+            pytest.skip("Transformer Engine general_gemm is unavailable")
+
+        batch = 16
+        model = nn.Linear(
+            16, 16, bias=False, device=_device(), dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            model.weight.fill_(1)
+        compute_weight = model.weight
+        model.forward = partial(
+            linear_with_grad_accumulation_and_async_allreduce,
+            weight=compute_weight,
+            bias=None,
+            gradient_accumulation_fusion=True,
+            allreduce_dgrad=False,
+            sequence_parallel=False,
+            grad_output_buffer=None,
+            wgrad_deferral_limit=0,
+            tp_group=None,
+        )
+        model.gradient_checkpointing = True
+        fully_shard(
+            model,
+            sharding_strategy=sharding_strategy,
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=main_grad_dtype,
+                main_grads_dtype=main_grad_dtype,
+            ),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=async_reduce,
+            enable_cuda_graph=True,
+        )
+        param_group = model._fsdp_param_groups[0]
+        samples = []
+        stable_main_grad_ptr = None
+
+        try:
+            for iteration, values in enumerate(
+                ((2.0, 3.0), (4.0, 5.0), (6.0, 7.0))
+            ):
+                if iteration:
+                    optimizer_only_zero = (
+                        iteration == 2
+                        and sharding_strategy in ("no_shard", "optim")
+                    )
+                    if optimizer_only_zero:
+                        for dist_param in param_group.dist_params:
+                            dist_param.grad = None
+                            if hasattr(dist_param, "decoupled_grad"):
+                                dist_param.decoupled_grad = None
+                    else:
+                        model.zero_grad(set_to_none=iteration != 1)
+                    if (
+                        sharding_strategy in ("no_shard", "optim")
+                        and not optimizer_only_zero
+                    ):
+                        assert param_group.main_grad_buffer.data is not None
+                        assert param_group.main_grad_buffer.data.data_ptr() == stable_main_grad_ptr
+                        assert torch.count_nonzero(param_group.main_grad_buffer.data) == 0
+
+                for microbatch, value in enumerate(values):
+                    sample = torch.full(
+                        (batch, 16),
+                        value,
+                        device=_device(),
+                        dtype=torch.bfloat16,
+                        requires_grad=True,
+                    )
+                    samples.append(sample)
+                    model(sample).sum().backward()
+                    torch.cuda.synchronize()
+
+                    assert param_group.main_grad_buffer._unsharded_buffer is None
+                    assert compute_weight.grad is None
+                    if sharding_strategy in ("optim_grads", "optim_grads_params"):
+                        assert not hasattr(compute_weight, "main_grad")
+                    else:
+                        main_grad = compute_weight.get_main_grad()
+                        assert compute_weight.main_grad.data_ptr() == main_grad.data_ptr()
+                        expected_local = batch * sum(values[: microbatch + 1])
+                        torch.testing.assert_close(
+                            main_grad, torch.full_like(main_grad, expected_local)
+                        )
+                        if stable_main_grad_ptr is None:
+                            stable_main_grad_ptr = main_grad.data_ptr()
+                        assert main_grad.data_ptr() == stable_main_grad_ptr
+
+                assert model._fsdp_cg_installed
+                assert model._fsdp_cg_activation_recompute
+                assert compute_weight._mfsdp_recorded_te_wgrad
+                assert param_group.main_grad_buffer.dtype == main_grad_dtype
+
+                if iteration == 0 and sharding_strategy in ("no_shard", "optim"):
+                    assert param_group._main_grad_buffer_has_unreduced_data
+                    pending_ptr = param_group.main_grad_buffer.data.data_ptr()
+                    with pytest.raises(RuntimeError, match="finish_grad_sync"):
+                        model.release_memory_pool()
+                    assert compute_weight._mfsdp_recorded_te_wgrad
+                    assert param_group._main_grad_buffer_has_unreduced_data
+                    assert param_group.main_grad_buffer.data.data_ptr() == pending_ptr
+
+                model.finish_grad_sync()
+                torch.cuda.synchronize()
+
+                dist_grad = param_group.dist_grads[0]
+                expected = batch * sum(values) * _world_size()
+                assert dist_grad.dtype == main_grad_dtype
+                torch.testing.assert_close(
+                    dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
+                )
+            for sample in samples:
+                torch.testing.assert_close(sample.grad, torch.full_like(sample, 16.0))
+
+            model.zero_grad(set_to_none=True)
+            if sharding_strategy in ("no_shard", "optim"):
+                assert param_group.main_grad_buffer.data is not None
+                assert param_group.main_grad_buffer.data.data_ptr() == stable_main_grad_ptr
+            model.release_memory_pool()
+            assert not hasattr(compute_weight, "_mfsdp_recorded_te_wgrad")
+            assert param_group.main_grad_buffer.data is None
+        finally:
+            model.release_memory_pool()
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+
+    def test_cuda_graph_capture_restores_stateful_registered_buffer(self):
+        """Keep capture-only forwards from changing persistent module state."""
+
+        class StatefulLinear(nn.Module):
+            """Increment one registered buffer on every forward."""
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4)
+                self.register_buffer("forward_count", torch.zeros(()))
+
+            def forward(self, input_tensor):
+                self.forward_count.add_(1)
+                return self.linear(input_tensor)
+
+        model = StatefulLinear().to(_device())
+        model.gradient_checkpointing = True
+        fully_shard(
+            model,
+            sharding_strategy="optim_grads_params",
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            enable_cuda_graph=True,
+        )
+
+        first = torch.ones(2, 4, device=_device(), requires_grad=True)
+        model(first).sum().backward()
+        torch.cuda.synchronize()
+        assert not getattr(model, "_fsdp_cg_installed", False)
+        assert model.forward_count.item() == 1
+
+        model.zero_grad(set_to_none=True)
+        second = torch.full_like(first, 2.0, requires_grad=True)
+        model(second).sum().backward()
+        torch.cuda.synchronize()
+        assert model._fsdp_cg_installed
+        assert model.forward_count.item() == 2
+
+        model.zero_grad(set_to_none=True)
+        third = torch.full_like(first, 3.0, requires_grad=True)
+        model(third).sum().backward()
+        torch.cuda.synchronize()
+        assert model.forward_count.item() == 4
+        model.release_memory_pool()
+        torch.cuda.synchronize()
+
+
 
     @pytest.mark.parametrize(
         "enable_unshard_prefetch,enable_async_reduce_grad",

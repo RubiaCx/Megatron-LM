@@ -16,6 +16,7 @@
 
 import functools
 import logging
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -80,6 +81,9 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
     ctx = target._fsdp_root_context
     assert not ctx.cuda_graph_active, "hooks must not fire during CUDA graph capture"
+    preflight = target.__dict__.get("_cuda_graph_preflight")
+    if callable(preflight):
+        preflight()
 
     # ---- root: forward-phase setup (once per micro-batch) ------------------
     if target._fsdp_state._is_root:
@@ -93,9 +97,10 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     # ---- unshard parameters for this module -------------------------------
     if ctx.backward_phase:
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
-        # Recompute still executes forward kernels. Fetch the current module's
-        # forward buffer without prefetching modules in forward order.
-        target.unshard(async_op=False, bwd_pass=False)
+        if getattr(target, "_fsdp_cg_activation_recompute", False):
+            # The recomputed-forward-plus-backward graph also needs the forward
+            # compute buffer. Ordinary checkpoint recompute uses the backward buffer.
+            target.unshard(async_op=False, bwd_pass=False)
     else:
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
@@ -119,7 +124,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
 
 @torch.compiler.disable
-def mfsdp_post_forward_hook(module: nn.Module, *unused):
+def mfsdp_post_forward_hook(module: nn.Module, *hook_args):
     """Post-forward hook: reshard parameters.
 
     Only supports direct FSDPModule calls.  Raises ``TypeError`` when
@@ -131,18 +136,34 @@ def mfsdp_post_forward_hook(module: nn.Module, *unused):
         )
     ctx = module._fsdp_root_context
     assert not ctx.cuda_graph_active, "hooks must not fire during CUDA graph capture"
-    if (
-        unused
-        and ctx.cuda_graph_runner is not None
-        and module._fsdp_state.enable_cuda_graph
-        and not getattr(module, "_fsdp_cg_installed", False)
-        and not ctx.backward_phase
-        and module.cuda_graph_compatible
-    ):
-        ctx.cuda_graph_runner.record_module_output(module, unused[-1])
-    if ctx.backward_phase and id(module) == ctx.backward_module:
-        return
-    module.reshard()
+    output = hook_args[-1] if hook_args else None
+    error = sys.exc_info()[1]
+    error_type = type(error)
+    checkpoint_early_stop = (
+        error is not None
+        and error_type.__module__ == "torch.utils.checkpoint"
+        and error_type.__name__ == "_StopRecomputationError"
+    )
+    keep_unsharded = checkpoint_early_stop or (
+        ctx.backward_phase
+        and output is not None
+        and id(module) == ctx.backward_module
+    )
+    try:
+        if (
+            output is not None
+            and ctx.cuda_graph_runner is not None
+            and module._fsdp_state.enable_cuda_graph
+            and not getattr(module, "_fsdp_cg_installed", False)
+            and not ctx.backward_phase
+            and module.cuda_graph_compatible
+        ):
+            ctx.cuda_graph_runner.record_module_output(module, output)
+    finally:
+        # Checkpoint early-stop is a successful recompute. Other exceptions
+        # must release the current module before propagating.
+        if not keep_unsharded:
+            module.reshard()
 
 
 # ---------------------------------------------------------------------------
@@ -174,16 +195,9 @@ def _register_forward_pre_hook(module: FSDPModule, fine_grained: bool = False) -
 
 def _register_forward_hook(module: FSDPModule):
     """Register post-forward hook to reshard parameters."""
-    module._mfsdp_forward_hook = module.register_forward_hook(mfsdp_post_forward_hook)
-
-
-def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
-    """Trigger batch CUDA graph capture via ``ctx.cuda_graph_runner``."""
-    if ctx.cuda_graph_runner is not None:
-        with torch.enable_grad():
-            ctx.cuda_graph_runner.capture_and_install(
-                root_module, capture_stream=ctx.cuda_graph_stream
-            )
+    module._mfsdp_forward_hook = module.register_forward_hook(
+        mfsdp_post_forward_hook, always_call=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +237,23 @@ def mfsdp_pre_backward_setup(
     target._fsdp_pre_backward_done = True
 
 
+def _defer_cuda_graph_grad_reduce(module: FSDPModule) -> bool:
+    """Return whether parameter AccumulateGrad must finish before reduction."""
+    if not getattr(module, "_fsdp_cg_installed", False):
+        return False
+    for param_group in module._fsdp_param_groups:
+        if param_group.sharding_strategy not in ("optim_grads", "optim_grads_params"):
+            continue
+        for param in param_group.params:
+            if (
+                param.requires_grad
+                and not getattr(param, "_mfsdp_recorded_te_wgrad", False)
+                and param_group.main_grad_buffer.dtype != param.dtype
+            ):
+                return True
+    return False
+
+
 @torch.compiler.disable
 def mfsdp_post_backward_hook(module: nn.Module):
     """Post-backward hook: reshard parameters and reduce gradients.
@@ -245,9 +276,11 @@ def mfsdp_post_backward_hook(module: nn.Module):
         if any(
             param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
             for param_group in submodule._fsdp_param_groups
-        ):
+        ) and not _defer_cuda_graph_grad_reduce(submodule):
             submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         submodule.post_backward_issued = True
+        if ctx.cuda_graph_runner is not None:
+            ctx.cuda_graph_runner.record_module_backward(submodule)
     ctx._advance_backward_module()
 
 
@@ -274,14 +307,48 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
 
     # ---- handle modules whose per-module post-backward was skipped ----
     for module in reversed(ctx.forward_order):
-        if module.post_backward_issued:
-            continue
-        module.reshard()
+        deferred_reduce = _defer_cuda_graph_grad_reduce(module)
+        if not module.post_backward_issued:
+            module.reshard()
         if any(
             param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
             for param_group in module._fsdp_param_groups
-        ):
-            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        ) and (not module.post_backward_issued or deferred_reduce):
+            # Mixed-dtype graph grads are published by parameter AccumulateGrad,
+            # which may run after the input-side post hook. Reduce them here,
+            # after the autograd engine has completed, one module at a time.
+            module.reduce_grad(
+                async_op=ctx.enable_async_reduce_grad and not deferred_reduce
+            )
+
+    # Direct-bound grads can leave a late alias after reduction. Fused wgrad
+    # also returns a dummy compute grad while the main-grad buffer is authoritative.
+    for module in ctx.forward_order:
+        enable_cuda_graph = getattr(
+            getattr(module, "_fsdp_state", None), "enable_cuda_graph", False
+        )
+        for param_group in module._fsdp_param_groups:
+            reduce_during_backward = param_group.sharding_strategy in (
+                "optim_grads",
+                "optim_grads_params",
+            )
+            for param in param_group.params:
+                recorded_fused_wgrad = getattr(
+                    param, "_mfsdp_recorded_te_wgrad", False
+                )
+                grad_added_to_main_grad = getattr(
+                    param, "grad_added_to_main_grad", False
+                )
+                if enable_cuda_graph and grad_added_to_main_grad:
+                    setattr(param, "_mfsdp_recorded_te_wgrad", True)
+                    recorded_fused_wgrad = True
+                main_grad_is_authoritative = (
+                    grad_added_to_main_grad or recorded_fused_wgrad
+                )
+                if main_grad_is_authoritative and not reduce_during_backward:
+                    param_group._main_grad_buffer_has_unreduced_data = True
+                if reduce_during_backward or main_grad_is_authoritative:
+                    param.grad = None
 
     # ---- drain pending async reduce-grad events -----------------------
     stream = ctx.rs_stream
@@ -332,7 +399,7 @@ def _maybe_capture_cuda_graphs(ctx, root_module) -> None:
         assert allocator.phase == "optimized", (
             f"CUDA graph capture requires allocator phase='optimized', " f"got '{allocator.phase}'"
         )
-        with torch.enable_grad(), torch.cuda.amp.autocast(enabled=False):
+        with torch.enable_grad():
             ctx.cuda_graph_runner.capture_and_install(
                 root_module, capture_stream=ctx.cuda_graph_stream
             )
@@ -406,6 +473,11 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
 
     # ---- unshard params for backward compute --------------------------
     module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
+    if getattr(module, "_fsdp_cg_activation_recompute", False):
+        # The captured backward graph starts with a recomputed forward.
+        # Fetch only this module's forward compute buffer; forward-order
+        # prefetch would keep unrelated buffers live during backward.
+        module.unshard(async_op=False, bwd_pass=False)
 
     # ---- reset per-module bookkeeping ---------------------------------
     module.post_backward_issued = False
@@ -414,19 +486,32 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
     for param_group in module._fsdp_param_groups:
         for param in param_group.params:
             param.grad_added_to_main_grad = False
-            param.overwrite_main_grad = param_group.sharding_strategy in (
-                "optim_grads_params",
-                "optim_grads",
+            param.overwrite_main_grad = (
+                param_group.sharding_strategy in ("optim_grads_params", "optim_grads")
+                or not getattr(
+                    param_group, "_main_grad_buffer_has_unreduced_data", False
+                )
             )
+        has_fused_wgrad = any(
+            getattr(param, "_mfsdp_recorded_te_wgrad", False)
+            for param in param_group.params
+        )
         # Keep trace and replay on the same main-grad buffer allocation.
         if (
             module._fsdp_state.enable_cuda_graph
             and param_group.requires_grad
             and param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-            and param_group.main_grad_buffer.dtype == param_group.params[0].dtype
+            and (
+                has_fused_wgrad
+                or param_group.main_grad_buffer.dtype == param_group.params[0].dtype
+            )
         ):
             param_group._init_dist_grads()
             param_group.main_grad_buffer.fetch_buffer()
+        if has_fused_wgrad:
+            for param in param_group.params:
+                if getattr(param, "_mfsdp_recorded_te_wgrad", False):
+                    param.main_grad = param.get_main_grad()
 
     return ctx
 
